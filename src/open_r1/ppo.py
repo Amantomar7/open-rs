@@ -253,6 +253,9 @@ def main(script_args, training_args, model_args):
     tokenizer.padding_side = "left"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    
+    # Also ensure this is saved in the tokenizer config so it persists if the tokenizer is reloaded
+    tokenizer.init_kwargs["padding_side"] = "left"
 
     REWARD_FUNCS_REGISTRY = {
         "accuracy": accuracy_reward,
@@ -291,11 +294,10 @@ def main(script_args, training_args, model_args):
     # Tokenize prompts for PPO - apply tokenizer to format as chat
     def tokenize_fn(example):
         # Convert prompt (list of dicts) to text using tokenizer's chat template
-        # PPOTrainer will add the generation prompt itself, so we DON'T add it here
         text = tokenizer.apply_chat_template(
             example["prompt"],
             tokenize=False,
-            add_generation_prompt=False  # PPOTrainer will add generation prompt
+            add_generation_prompt=True  # Add generation prompt for model to continue
         )
         # Tokenize the text
         tokens = tokenizer(
@@ -307,12 +309,6 @@ def main(script_args, training_args, model_args):
         return tokens
     
     logger.info("*** Tokenizing dataset ***")
-    # Store solutions before removing columns
-    solutions_map = {}
-    if "solution" in dataset["train"].column_names:
-        for idx, example in enumerate(dataset["train"]):
-            solutions_map[idx] = example["solution"]
-    
     # Remove non-tokenized columns and tokenize
     columns_to_remove = [col for col in dataset["train"].column_names if col not in ["input_ids", "attention_mask", "prompt"]]
     dataset = dataset.map(
@@ -320,17 +316,6 @@ def main(script_args, training_args, model_args):
         batched=False,
         remove_columns=["problem", "solution", "answer", "level", "prompt"] if "problem" in dataset["train"].column_names else []
     )
-    
-    # Log sample from dataset to understand structure
-    sample = dataset["train"][0]
-    logger.info(f"Sample dataset entry keys: {sample.keys()}")
-    logger.info(f"Sample input_ids length: {len(sample['input_ids'])}")
-    logger.info(f"Sample input_ids (first 30 tokens): {sample['input_ids'][:30]}")
-    decoded_sample = tokenizer.decode(sample['input_ids'], skip_special_tokens=False)
-    logger.info(f"Sample decoded prompt: {decoded_sample[:300]}")
-    
-    # Store solutions as metadata for reward computation
-    training_args.solutions_map = solutions_map
 
 
     logger.info("*** Initializing model kwargs ***")
@@ -403,103 +388,15 @@ def main(script_args, training_args, model_args):
         peft_config=get_peft_config(model_args),
         callbacks=get_callbacks(training_args, model_args),
     )
+    
+    # Ensure the trainer's processing_class (tokenizer) has the correct padding_side
+    # This must be set after trainer initialization as TRL might reset it
+    if hasattr(trainer, 'processing_class'):
+        trainer.processing_class.padding_side = "left"
+        if trainer.processing_class.pad_token is None:
+            trainer.processing_class.pad_token = trainer.processing_class.eos_token
 
     logger.info("*** Train ***")
-    
-    # Patch the get_reward function to work with our reward functions
-    # The standard get_reward() expects a model with .score() that processes hidden states
-    # We need to compute rewards from text completions instead
-    from trl.trainer.utils import get_reward as original_get_reward
-    from trl.trainer.utils import first_true_indices, truncate_response
-    
-    def patched_get_reward(model, query_responses, pad_token_id, context_length):
-        """
-        Modified get_reward that handles our reward functions wrapper.
-        This properly extracts completions and calls reward functions.
-        
-        Args:
-            model: Reward model
-            query_responses: (batch_size, seq_len) tensor of token ids
-            pad_token_id: Token ID for padding
-            context_length: Length of the prompt (where generation starts)
-        """
-        # If it's our reward wrapper, handle specially
-        if isinstance(model, RewardFunctionsWrapper):
-            batch_size = query_responses.shape[0]
-            seq_len = query_responses.shape[1]
-            device = query_responses.device
-            
-            # Log some debug info on first batch
-            if not hasattr(patched_get_reward, 'logged'):
-                logger.info(f"PPO Reward computation - context_length: {context_length}, seq_len: {seq_len}, batch_size: {batch_size}")
-                logger.info(f"Sample prompt tokens: {query_responses[0, :context_length].tolist()[:20]}...")
-                logger.info(f"Sample completion tokens: {query_responses[0, context_length:min(context_length+20, seq_len)].tolist()}")
-                patched_get_reward.logged = True
-            
-            # Compute sequence lengths
-            attention_mask = query_responses != pad_token_id
-            # Find where padding starts (first pad token after context)
-            sequence_lengths = torch.full((batch_size,), seq_len - 1, device=device, dtype=torch.long)
-            for i in range(batch_size):
-                # Find first pad token after context_length
-                for j in range(context_length, seq_len):
-                    if query_responses[i, j] == pad_token_id:
-                        sequence_lengths[i] = max(j - 1, context_length)
-                        break
-            
-            # Extract completions (only the generated part after prompt)
-            completions = query_responses[:, context_length:]
-            completion_texts = tokenizer.batch_decode(completions, skip_special_tokens=True)
-            
-            if not hasattr(patched_get_reward, 'logged_text'):
-                logger.info(f"Sample completion text: {completion_texts[0][:200]}")
-                patched_get_reward.logged_text = True
-            
-            rewards_list = []
-            for text in completion_texts:
-                total_reward = 0.0
-                reward_breakdown = {}
-                
-                for reward_func, weight in zip(model.reward_funcs, model.reward_weights):
-                    try:
-                        # Format completion for reward function
-                        # Reward functions expect [{"role": "assistant", "content": "..."}]
-                        completion_formatted = [{"role": "assistant", "content": text}]
-                        reward = reward_func([completion_formatted])
-                        # reward is returned as list
-                        if isinstance(reward, list):
-                            reward = reward[0]
-                        reward_value = weight * float(reward)
-                        total_reward += reward_value
-                        reward_breakdown[reward_func.__name__] = (float(reward), reward_value)
-                    except Exception as e:
-                        logger.debug(f"Error computing reward: {e}")
-                        reward_breakdown[reward_func.__name__] = (0.0, 0.0)
-                
-                if len(rewards_list) < 2 and total_reward > 0:
-                    logger.info(f"Reward breakdown for completion: {reward_breakdown}, total: {total_reward}")
-                
-                rewards_list.append(total_reward)
-            
-            # Create reward logits tensor (batch_size, seq_len)
-            reward_logits = torch.zeros(batch_size, seq_len, device=device, dtype=torch.float32)
-            
-            # Set the reward at the last valid position of each sequence
-            for i in range(batch_size):
-                seq_end = min(sequence_lengths[i].item(), seq_len - 1)
-                reward_logits[i, seq_end] = rewards_list[i]
-            
-            # Return (reward_logits, final_rewards, sequence_lengths)
-            final_rewards = torch.tensor(rewards_list, device=device, dtype=torch.float32)
-            
-            return reward_logits, final_rewards, sequence_lengths
-        
-        # For other models (value model), use original get_reward
-        return original_get_reward(model, query_responses, pad_token_id, context_length)
-    
-    # Patch get_reward in the trainer module
-    import trl.trainer.ppo_trainer as ppo_trainer_module
-    ppo_trainer_module.get_reward = patched_get_reward
     
     # Run standard training
     train_result = trainer.train()
