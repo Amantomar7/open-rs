@@ -131,12 +131,19 @@ class RewardFunctionsWrapper(torch.nn.Module):
                 else:
                     text = str(input_id_seq)
                 
+                # Format completion as expected by reward functions: [{"role": "assistant", "content": text}]
+                completion = [{"role": "assistant", "content": text}]
+                
                 # Compute combined reward
                 total_reward = 0.0
                 for reward_func, weight in zip(self.reward_funcs, self.reward_weights):
                     try:
-                        reward = reward_func(text)
-                        total_reward += weight * float(reward)
+                        # Reward functions expect completions as a list of dicts
+                        # and return a list of rewards, so we take the first element
+                        reward_value = reward_func([completion])
+                        if isinstance(reward_value, list):
+                            reward_value = reward_value[0]
+                        total_reward += weight * float(reward_value)
                     except Exception as e:
                         logger.debug(f"Error computing reward: {e}")
                 
@@ -352,6 +359,23 @@ def main(script_args, training_args, model_args):
     if torch_dtype == torch.bfloat16:
         policy_model = policy_model.bfloat16()
     
+    # Configure generation settings for PPO
+    # Use response_length from training_args (PPO standard) or max_completion_length from config if present
+    max_new_tokens = getattr(training_args, 'response_length', 512)
+    if hasattr(training_args, 'max_completion_length') and training_args.max_completion_length:
+        max_new_tokens = training_args.max_completion_length
+    
+    logger.info(f"Configuring generation with max_new_tokens={max_new_tokens}")
+    policy_model.generation_config.max_new_tokens = max_new_tokens
+    policy_model.generation_config.temperature = training_args.temperature
+    policy_model.generation_config.top_p = 0.95
+    policy_model.generation_config.do_sample = True
+    policy_model.generation_config.pad_token_id = tokenizer.pad_token_id
+    policy_model.generation_config.eos_token_id = tokenizer.eos_token_id
+    # Ensure generation doesn't stop prematurely
+    if hasattr(policy_model.generation_config, 'forced_eos_token_id'):
+        policy_model.generation_config.forced_eos_token_id = None
+    
     # Create or load value model
     if script_args.value_model_name_or_path:
         logger.info(f"*** Loading value model {script_args.value_model_name_or_path} ***")
@@ -363,6 +387,14 @@ def main(script_args, training_args, model_args):
         )
         if torch_dtype == torch.bfloat16:
             value_model_base = value_model_base.bfloat16()
+        
+        # Configure value model generation settings
+        value_model_base.generation_config.max_new_tokens = max_new_tokens
+        value_model_base.generation_config.temperature = training_args.temperature
+        value_model_base.generation_config.do_sample = True
+        value_model_base.generation_config.pad_token_id = tokenizer.pad_token_id
+        value_model_base.generation_config.eos_token_id = tokenizer.eos_token_id
+        
         value_model = ValueModelWrapper(value_model_base)
     else:
         # Use policy model as value model too (common PPO setup)

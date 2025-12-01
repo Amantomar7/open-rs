@@ -44,11 +44,15 @@ push_to_hub: true
 report_to:
 - wandb
 reward_funcs:
-- format
-- cosine
+  - accuracy
+  - format
+  - cosine
+  - reasoning_steps
 reward_weights:
-- 1.0
-- 2.0
+  - 2.0
+  - 1.0
+  - 1.0
+  - 0.5
 save_strategy: "steps"
 save_steps: 50
 seed: 42

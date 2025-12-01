@@ -82,6 +82,10 @@ class PPOConfig(trl.PPOConfig):
         default=None,
         metadata={"help": ("The project to store runs under.")},
     )
+    max_completion_length: Optional[int] = field(
+        default=None,
+        metadata={"help": "Maximum length of model completions (overrides response_length if set)."},
+    )
 
 
 @dataclass
