@@ -89,11 +89,9 @@ ACCELERATE_LOG_LEVEL=info accelerate launch \
   --config recipes/grpo.yaml
 ```
 
-Train models using a PPO YAML config with 2 GPUs (set `num_processes=2`):
+Train models using a PPO YAML config with 1 GPUs:
 ```bash
-ACCELERATE_LOG_LEVEL=info accelerate launch \
-  --config_file recipes/accelerate_configs/ddp.yaml \
-  --num_processes=2 \
+ACCELERATE_LOG_LEVEL=info python \
   src/open_r1/ppo.py \
   --config recipes/ppo.yaml
 ```
