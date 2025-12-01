@@ -1,6 +1,6 @@
 #!/bin/sh
 # Base model configuration
-MODEL="knoveleng/OpenRS-GRPO"
+MODEL="/home/rl-group10/training_scripts/open-rs/data/OpenRS-PPO_v1"
 BASE_MODEL_ARGS="pretrained=$MODEL,dtype=bfloat16,max_model_length=32768,gpu_memory_utilization=0.8,generation_parameters={max_new_tokens:32768,temperature:0.6,top_p:0.95}"
 
 # Define evaluation tasks
